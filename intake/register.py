@@ -1,7 +1,9 @@
 from archive_db import NotFound, connection, require_name, transaction
 from corrections.journal import initialise_corrections
 from corrections.pending import initialise_reservations
+from corrections.retest import initialise_retest_returns
 from delivery.current import read_current_fields
+from delivery.retest import initialise_retest_tickets
 from delivery.snapshot import FixedReport, initialise_reports, save_fixed_report
 from intake.archive import get_original, initialise_originals, match_original, save_original
 from intake.validate import validate_volume
@@ -23,6 +25,8 @@ def initialise_archive(path):
             initialise_corrections(db)
             initialise_reservations(db)
             initialise_reports(db)
+            initialise_retest_tickets(db)
+            initialise_retest_returns(db)
 
 
 def ingest(path, volume_id, layout_id, rows, manifest):

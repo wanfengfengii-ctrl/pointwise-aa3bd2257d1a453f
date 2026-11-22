@@ -3,9 +3,10 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from archive_db import ReplyLost
-from corrections.recover import resume
-from corrections.request import amend
-from delivery.current import current
+from corrections.pending import FieldsBusy
+from corrections.recover import CancelledCorrection, resume
+from corrections.request import amend, return_retest
+from delivery.current import current, issue_retest, read_retest
 from delivery.reconcile import reconcile
 from delivery.snapshot import frozen
 from intake.manifest import ManifestEntry
@@ -20,6 +21,7 @@ LAYOUT = LayoutSpec('calibration-8', 8, 2, (
     FieldSpec('x', 0, 0, 3, 7), FieldSpec('y', 1, 0, 3, 7), FieldSpec('z', 0, 3, 3, 7),
 ))
 ROWS = (InputRow('R-20', 4, 2, (17, 3)), InputRow('R-02', 5, 1, (184, 128)))
+NIGHT_ROWS = (InputRow('R-20', 4, 2, (23, 7)), ROWS[1])
 MANIFEST = (ManifestEntry('R-20', 2, 4, 2), ManifestEntry('R-02', 2, 5, 1))
 A_CHANGES = (('R-20', 'x', 4), ('R-20', 'y', 5))
 B_CHANGES = (('R-20', 'z', 6),)
@@ -88,6 +90,107 @@ def _scenario(path, action):
     print('POINTWISE_SCENARIO ' + json.dumps(record, ensure_ascii=False, sort_keys=True))
 
 
+def _night_moves(path, volume, action):
+    """The shared night-shift opening: tickets, re-missing, rejection and the paused return."""
+    ingest(path, volume, LAYOUT.layout_id, NIGHT_ROWS, MANIFEST)
+    opened_p = issue_retest(path, volume, f'P-{action}', ('y', 'x'))
+    assert tuple(item['field_name'] for item in opened_p['items']) == ('x', 'y')
+    assert all(item['opened'].kind == 'original' for item in opened_p['items'])
+    amend(path, volume, f'repeat-missing-{action}', (('R-20', 'x', MISSING),))
+    opened_p2 = issue_retest(path, volume, f'P2-{action}', ('x',))
+    assert opened_p2['items'][0]['opened'].kind == 'original'
+    amend(path, volume, f'ordinary-fill-{action}', (('R-20', 'x', 2),))
+    amend(path, volume, f'missing-again-{action}', (('R-20', 'x', MISSING),))
+    opened_q = issue_retest(path, volume, f'Q-{action}', ('x', 'y'))
+    issue_retest(path, volume, f'Q2-{action}', ('x',))
+    assert opened_q['items'][0]['opened'].request_id == f'missing-again-{action}'
+    assert opened_q['items'][1]['opened'].kind == 'original'
+    rejected = return_retest(path, f'P-{action}', f'R-P-{action}', ((1, 5), (2, 4)))
+    assert rejected['status'] == 'rejected'
+    assert tuple(item['item_id'] for item in rejected['blocked']) == (1,)
+    assert rejected['blocked'][0]['closed_by'].request_id == f'ordinary-fill-{action}'
+    try:
+        return_retest(path, f'Q-{action}', f'R-Q-{action}', ((1, 0), (2, 4)), hook=lose_at('after_word_commit'))
+    except ReplyLost as loss:
+        assert (loss.detail.before, loss.detail.after) == (23, 16)
+    else:
+        raise AssertionError('The first word reply was delivered')
+    amend(path, volume, f'shared-word-{action}', (('R-20', 'z', 6),))
+    try:
+        amend(path, volume, f'same-field-{action}', (('R-20', 'x', 5),))
+    except FieldsBusy as busy:
+        assert busy.holder == f'R-Q-{action}'
+    else:
+        raise AssertionError('expected busy field')
+    paused = {
+        'blocked': tuple(item['item_id'] for item in rejected['blocked']),
+        'q_items': tuple(item['status'] for item in read_retest(path, f'Q-{action}')['items']),
+        'word0': reconcile(path, volume).words[0].actual_word,
+        'busy_holder': f'R-Q-{action}',
+    }
+    expected_paused = {'blocked': (1,), 'q_items': ('pending', 'pending'),
+                       'word0': 48, 'busy_holder': f'R-Q-{action}'}
+    assert paused == expected_paused, ('RETEST_PAUSED', paused, expected_paused)
+    return rejected, paused, expected_paused
+
+
+def _night_scenario(path, action):
+    volume = f'night-{action}'
+    rejected, paused, expected_paused = _night_moves(path, volume, action)
+    initialise_archive(path)
+    if action == 'continue':
+        receipt = resume(path, f'R-Q-{action}')
+        closed_view = read_retest(path, f'Q-{action}')
+        assert all(item['closed_by'].request_id == f'R-Q-{action}' for item in closed_view['items'])
+        filled_words = tuple(word.actual_word for word in reconcile(path, volume).words[:2])
+        assert filled_words == (48, 4), ('RETEST_FILLED_WORDS', filled_words)
+        amend(path, volume, f'later-missing-{action}', (('R-20', 'x', MISSING),))
+        assert read_retest(path, f'Q-{action}') == closed_view
+        assert return_retest(path, f'Q-{action}', f'R-Q-{action}', ((2, 4), (1, 0))) == receipt
+        assert return_retest(path, f'P-{action}', f'R-P-{action}', ((1, 5), (2, 4))) == rejected
+        assert frozen(path, receipt.report_id).receipt == receipt
+        expected = {
+            'q_items': ('filled', 'filled'), 'q2_x': 'superseded', 'p_items': ('corrected', 'superseded'),
+            'words': (55, 4), 'values': (None, 4, 6),
+            'sources': (f'later-missing-{action}', f'R-Q-{action}', f'shared-word-{action}'),
+        }
+    else:
+        cancelled = resume(path, f'R-Q-{action}', action='cancel')
+        assert cancelled == CancelledCorrection(f'R-Q-{action}', volume)
+        assert return_retest(path, f'Q-{action}', f'R-Q-{action}', ((1, 0), (2, 4))) == cancelled
+        expected = {
+            'q_items': ('pending', 'pending'), 'q2_x': 'pending', 'p_items': ('corrected', 'pending'),
+            'words': (55, 7), 'values': (None, None, 6),
+            'sources': (f'missing-again-{action}', None, f'shared-word-{action}'),
+        }
+    ledger = reconcile(path, volume)
+    now = current(path, volume)
+    actual = {
+        'q_items': tuple(item['status'] for item in read_retest(path, f'Q-{action}')['items']),
+        'q2_x': read_retest(path, f'Q2-{action}')['items'][0]['status'],
+        'p_items': tuple(item['status'] for item in read_retest(path, f'P-{action}')['items']),
+        'words': tuple(word.actual_word for word in ledger.words[:2]),
+        'values': reading_group(now),
+        'sources': source_group(now),
+    }
+    assert ledger.settled and actual == expected, ('RETEST_FINAL', actual, expected)
+    record = {
+        'case_id': 'v7.retest_filled' if action == 'continue' else 'v8.retest_cancelled',
+        'input': {'original_words': NIGHT_ROWS[0].words,
+                  'tickets': {'P': ['y', 'x'], 'P2': ['x'], 'Q': ['x', 'y'], 'Q2': ['x']},
+                  'returns': {'R-P': [[1, 5], [2, 4]], 'R-Q': [[1, 0], [2, 4]]},
+                  'action': action},
+        'expected': expected_paused,
+        'actual': paused,
+        'downstream_expected': expected,
+        'downstream_actual': actual,
+        'code_paths': ['delivery/retest.py', 'corrections/request.py', 'corrections/retest.py',
+                       'corrections/recover.py'],
+        'oracle': '首字手算为 x + 8*z，次字低三位为 y。欠测起点与结案出处按发布序核对，拒收单只列当时已结案项。',
+    }
+    print('POINTWISE_SCENARIO ' + json.dumps(record, ensure_ascii=False, sort_keys=True))
+
+
 def main():
     with TemporaryDirectory() as directory:
         path = Path(directory) / 'day.sqlite3'
@@ -95,6 +198,8 @@ def main():
         define(path, LAYOUT)
         _scenario(path, 'continue')
         _scenario(path, 'cancel')
+        _night_scenario(path, 'continue')
+        _night_scenario(path, 'cancel')
 
 
 if __name__ == '__main__':

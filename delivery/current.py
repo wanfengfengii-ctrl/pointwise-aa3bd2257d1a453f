@@ -1,6 +1,7 @@
 from archive_db import WordUnavailable, checkpoint, connection, require_name, transaction
 from corrections.journal import read_field_evidence
 from delivery.provenance import select_field_observation
+from delivery.retest import issue_retest, read_retest
 from delivery.selection import resolve_selection
 from intake.archive import get_original
 from intake.origin import build_origin_index, locate_original_field

@@ -159,6 +159,15 @@ def read_field_evidence(db, address, field_name, *, published_only=False):
     return None if row is None else _field_evidence(row)
 
 
+def published_field_history(db, address, field_name):
+    """Published (target, request_id, publication) entries for one field, in publication order."""
+    rows = db.execute('''SELECT f.target_value, f.request_id, r.publication
+        FROM correction_fields f JOIN correction_requests r USING (request_id)
+        WHERE r.volume_id = ? AND f.row_id = ? AND f.slot = ? AND f.field_name = ? AND r.state = 'published'
+        ORDER BY r.publication''', (*address.parameters(), field_name))
+    return tuple((load_reading(row['target_value']), row['request_id'], row['publication']) for row in rows)
+
+
 def request_fields(db, request_id):
     rows = db.execute('''SELECT f.*, r.volume_id, r.state, r.publication
         FROM correction_fields f JOIN correction_requests r USING (request_id)
